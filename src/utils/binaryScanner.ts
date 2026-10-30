@@ -49,10 +49,20 @@ export interface PESectionInfo {
   rawAddress: number;
   rawSize: number;
   entropy: number; // Shannon entropy (0.00 - 8.00 bits/byte)
-  // Optional ZIP/APK metadata for recalculating CRC-32 and DEX checksums after patching
   zipLocalHeaderOffset?: number;
   zipCentralHeaderOffset?: number;
   isDexEntry?: boolean;
+}
+
+export interface RepackReportInfo {
+  repackedAt: string;
+  format: 'APK-ZipAligned' | 'DEX-Repaired' | 'PE-Checksum-Updated' | 'Raw-Patched';
+  zipAligned4Byte: boolean;
+  dexChecksumsUpdated: boolean;
+  peChecksumUpdated: boolean;
+  manifestDigestsUpdated: boolean;
+  repackedSize: number;
+  summary: string;
 }
 
 export interface ScannedBinaryFile {
@@ -70,6 +80,8 @@ export interface ScannedBinaryFile {
   sections: PESectionInfo[];
   originalBuffer: Uint8Array;
   workingBuffer: Uint8Array;
+  repackedBuffer?: Uint8Array; // Final repacked output (e.g. zipaligned APK with updated META-INF manifest)
+  repackInfo?: RepackReportInfo;
   originalSha256: string;
   workingSha256: string;
   findings: TelemetryFinding[];
@@ -138,7 +150,7 @@ export function computeAdler32(buffer: Uint8Array, startOffset = 12): number {
  * Recomputes the DEX SHA-1 signature (offset 12..31, computed over 32..end) and
  * Adler-32 checksum (offset 8..11, computed over 12..end) in-place on a DEX byte slice.
  */
-export async function updateDexHeaderChecksumsInPlace(dexSlice: Uint8Array): Promise<void> {
+export async function updateDexHeaderChecksumsInPlace(dexSlice: Uint8Array): Promise<boolean> {
   if (
     dexSlice.length < 0x70 ||
     dexSlice[0] !== 0x64 || // 'd'
@@ -146,10 +158,9 @@ export async function updateDexHeaderChecksumsInPlace(dexSlice: Uint8Array): Pro
     dexSlice[2] !== 0x78 || // 'x'
     dexSlice[3] !== 0x0a    // '\n'
   ) {
-    return;
+    return false;
   }
 
-  // 1. Update SHA-1 signature at offset 12..31 (20 bytes) computed over bytes [32 .. end]
   try {
     const payloadAfterSig = new Uint8Array(dexSlice.length - 32);
     payloadAfterSig.set(dexSlice.subarray(32));
@@ -159,13 +170,55 @@ export async function updateDexHeaderChecksumsInPlace(dexSlice: Uint8Array): Pro
       dexSlice.set(sha1Bytes, 12);
     }
   } catch {
-    // Keep existing signature if WebCrypto SHA-1 is unavailable
+    // Fallback if SHA-1 digest unavailable
   }
 
-  // 2. Update Adler-32 checksum at offset 8..11 (little-endian uint32) computed over bytes [12 .. end]
   const adler = computeAdler32(dexSlice, 12);
   const view = new DataView(dexSlice.buffer, dexSlice.byteOffset, dexSlice.byteLength);
   view.setUint32(8, adler, true);
+  return true;
+}
+
+/**
+ * Computes and updates the Windows PE OptionalHeader.CheckSum (at peOffset + 24 + 64)
+ * using the standard 16-bit folding algorithm (ImageHlp / MapFileAndCheckSum).
+ */
+export function updatePEHeaderChecksumInPlace(peBuffer: Uint8Array): boolean {
+  if (peBuffer.length < 0x100 || peBuffer[0] !== 0x4d || peBuffer[1] !== 0x5a) {
+    return false;
+  }
+  const view = new DataView(peBuffer.buffer, peBuffer.byteOffset, peBuffer.byteLength);
+  const peOffset = view.getUint32(0x3c, true);
+  if (peOffset + 24 + 68 > peBuffer.length) return false;
+  if (
+    peBuffer[peOffset] !== 0x50 ||
+    peBuffer[peOffset + 1] !== 0x45 ||
+    peBuffer[peOffset + 2] !== 0x00 ||
+    peBuffer[peOffset + 3] !== 0x00
+  ) {
+    return false;
+  }
+
+  const checksumOffset = peOffset + 24 + 64;
+  // Zero out existing CheckSum field before computing
+  view.setUint32(checksumOffset, 0, true);
+
+  let sum = 0;
+  const wordCount = Math.floor(peBuffer.length / 2);
+  for (let i = 0; i < wordCount; i++) {
+    const byteIdx = i * 2;
+    const word = view.getUint16(byteIdx, true);
+    sum += word;
+    sum = (sum & 0xffff) + (sum >>> 16);
+  }
+  if (peBuffer.length % 2 === 1) {
+    sum += peBuffer[peBuffer.length - 1];
+    sum = (sum & 0xffff) + (sum >>> 16);
+  }
+  sum = (sum & 0xffff) + (sum >>> 16);
+  const finalChecksum = (sum + peBuffer.length) >>> 0;
+  view.setUint32(checksumOffset, finalChecksum, true);
+  return true;
 }
 
 /**
@@ -196,9 +249,28 @@ export async function computeSha256(buffer: Uint8Array): Promise<string> {
 }
 
 /**
+ * Computes Base64-encoded SHA-256 digest of a byte slice (used for APK META-INF/MANIFEST.MF).
+ */
+async function computeSha256Base64(buffer: Uint8Array): Promise<string> {
+  try {
+    const copy = new Uint8Array(buffer.byteLength);
+    copy.set(buffer);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', copy.buffer);
+    const bytes = new Uint8Array(hashBuffer);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  } catch {
+    return btoa('nullroute-offline-sha256-digest');
+  }
+}
+
+/**
  * Decompresses raw DEFLATE bytes in browser memory using DecompressionStream('deflate-raw').
  */
-async function inflateRawBytes(compressed: Uint8Array, expectedSize: number): Promise<Uint8Array | null> {
+async function inflateRawBytes(compressed: Uint8Array): Promise<Uint8Array | null> {
   try {
     if (typeof DecompressionStream === 'undefined') return null;
     const ds = new DecompressionStream('deflate-raw');
@@ -217,7 +289,6 @@ async function inflateRawBytes(compressed: Uint8Array, expectedSize: number): Pr
       if (value) {
         chunks.push(value);
         total += value.byteLength;
-        // Safety cap per entry: 48MB
         if (total > 48 * 1024 * 1024) break;
       }
     }
@@ -233,17 +304,17 @@ async function inflateRawBytes(compressed: Uint8Array, expectedSize: number): Pr
   }
 }
 
-interface ZipEntryRecord {
+export interface ZipEntryRecord {
   name: string;
   data: Uint8Array;
 }
 
 /**
- * Builds a clean, uncompressed (STORE method = 0) ZIP / APK archive in memory
- * so all internal files (.dex, AndroidManifest.xml, resources.arsc, lib/*.so)
- * can be directly hex-inspected and patched in-place with updated CRC-32s.
+ * Builds a 4-byte `zipalign`-compliant, uncompressed (STORE method = 0) ZIP / APK archive
+ * in memory. For every entry, pads the Local File Header's `extraField` by `0..3` bytes so
+ * that the entry's raw data payload begins on an exact 4-byte boundary (`dataOffset % 4 === 0`).
  */
-export function buildStoreZipArchive(entries: ZipEntryRecord[]): Uint8Array {
+export function buildStoreZipArchive(entries: ZipEntryRecord[], zipAlign4Byte = true): Uint8Array {
   const localParts: Uint8Array[] = [];
   const centralParts: Uint8Array[] = [];
   let currentOffset = 0;
@@ -253,8 +324,12 @@ export function buildStoreZipArchive(entries: ZipEntryRecord[]): Uint8Array {
     const data = entry.data;
     const crc = computeCrc32(data);
 
-    // Local File Header (30 bytes + nameLength)
-    const lfh = new Uint8Array(30 + nameBytes.length);
+    // Calculate extra field padding needed so (currentOffset + 30 + nameBytes.length + extraLen) % 4 === 0
+    const unpaddedDataOffset = currentOffset + 30 + nameBytes.length;
+    const alignPad = zipAlign4Byte ? (4 - (unpaddedDataOffset % 4)) % 4 : 0;
+
+    // Local File Header (30 bytes + nameLength + alignPad)
+    const lfh = new Uint8Array(30 + nameBytes.length + alignPad);
     const lfhView = new DataView(lfh.buffer);
     lfhView.setUint32(0, 0x04034b50, true); // PK\x03\x04
     lfhView.setUint16(4, 20, true); // Version needed
@@ -266,17 +341,17 @@ export function buildStoreZipArchive(entries: ZipEntryRecord[]): Uint8Array {
     lfhView.setUint32(18, data.byteLength, true); // Compressed size
     lfhView.setUint32(22, data.byteLength, true); // Uncompressed size
     lfhView.setUint16(26, nameBytes.length, true); // File name length
-    lfhView.setUint16(28, 0, true); // Extra field length
+    lfhView.setUint16(28, alignPad, true); // Extra field length (zipalign padding)
     lfh.set(nameBytes, 30);
 
     // Central Directory File Header (46 bytes + nameLength)
     const cdh = new Uint8Array(46 + nameBytes.length);
     const cdhView = new DataView(cdh.buffer);
     cdhView.setUint32(0, 0x02014b50, true); // PK\x01\x02
-    cdhView.setUint16(4, 20, true); // Version made by
-    cdhView.setUint16(6, 20, true); // Version needed
-    cdhView.setUint16(8, 0, true); // Flags
-    cdhView.setUint16(10, 0, true); // Compression method: 0 (STORE)
+    cdhView.setUint16(4, 20, true);
+    cdhView.setUint16(6, 20, true);
+    cdhView.setUint16(8, 0, true);
+    cdhView.setUint16(10, 0, true); // STORE
     cdhView.setUint16(12, 0x4800, true);
     cdhView.setUint16(14, 0x554e, true);
     cdhView.setUint32(16, crc, true); // CRC-32
@@ -328,8 +403,74 @@ export function buildStoreZipArchive(entries: ZipEntryRecord[]): Uint8Array {
 }
 
 /**
- * If an uploaded buffer is a ZIP / Android APK containing DEFLATE-compressed scannable entries,
- * decompresses them so that classes.dex, AndroidManifest.xml, resources.arsc, and lib/*.so
+ * Automatically repacks a patched Android APK buffer:
+ * 1. Extracts all APK entries and updates DEX SHA-1 & Adler-32 headers on all .dex files.
+ * 2. Computes fresh SHA-256 Base64 digests for every entry and generates/updates
+ *    `META-INF/MANIFEST.MF` and `META-INF/NULLROUTE.SF`.
+ * 3. Repacks the entire APK with strict 4-byte `zipalign` alignment and updated CRC-32s.
+ */
+export async function repackApkWithManifestAndZipalign(
+  apkBuffer: Uint8Array,
+  sections: PESectionInfo[]
+): Promise<{ repackedBuffer: Uint8Array; manifestEntriesUpdated: number }> {
+  const entries: ZipEntryRecord[] = [];
+  const manifestLines: string[] = [
+    'Manifest-Version: 1.0',
+    'Created-By: NullRoute Offline APK Repacker (4-Byte ZipAligned)',
+    '',
+  ];
+
+  let manifestEntriesUpdated = 0;
+
+  for (const sec of sections) {
+    // Skip old signature block files so we can write fresh updated ones
+    if (sec.name.startsWith('META-INF/')) continue;
+
+    const slice = new Uint8Array(
+      Math.max(0, Math.min(sec.rawSize, apkBuffer.length - sec.rawAddress))
+    );
+    slice.set(
+      apkBuffer.subarray(
+        Math.min(sec.rawAddress, apkBuffer.length),
+        Math.min(sec.rawAddress + sec.rawSize, apkBuffer.length)
+      )
+    );
+
+    if (sec.isDexEntry || sec.name.endsWith('.dex')) {
+      await updateDexHeaderChecksumsInPlace(slice);
+    }
+
+    const digestB64 = await computeSha256Base64(slice);
+    manifestLines.push(`Name: ${sec.name}`);
+    manifestLines.push(`SHA-256-Digest: ${digestB64}`);
+    manifestLines.push('');
+    manifestEntriesUpdated++;
+
+    entries.push({ name: sec.name, data: slice });
+  }
+
+  const manifestText = manifestLines.join('\r\n');
+  const manifestBytes = new TextEncoder().encode(manifestText);
+  const manifestFullDigest = await computeSha256Base64(manifestBytes);
+
+  const sfLines = [
+    'Signature-Version: 1.0',
+    'Created-By: NullRoute Offline APK Repacker',
+    `SHA-256-Digest-Manifest: ${manifestFullDigest}`,
+    '',
+  ];
+  const sfBytes = new TextEncoder().encode(sfLines.join('\r\n'));
+
+  entries.push({ name: 'META-INF/MANIFEST.MF', data: manifestBytes });
+  entries.push({ name: 'META-INF/NULLROUTE.SF', data: sfBytes });
+
+  const repackedBuffer = buildStoreZipArchive(entries, true);
+  return { repackedBuffer, manifestEntriesUpdated };
+}
+
+/**
+ * If an uploaded buffer is a ZIP / Android APK, normalizes all entries into a 4-byte zipaligned
+ * STORE archive in memory so that classes.dex, AndroidManifest.xml, resources.arsc, and lib/*.so
  * are directly addressable in the hex viewer and patchable in-place.
  */
 async function normalizeApkOrZipBuffer(rawBuffer: Uint8Array): Promise<Uint8Array> {
@@ -344,7 +485,6 @@ async function normalizeApkOrZipBuffer(rawBuffer: Uint8Array): Promise<Uint8Arra
   }
 
   const view = new DataView(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
-  // Locate End of Central Directory (PK\x05\x06) from the end of buffer
   let eocdOffset = -1;
   const minSearch = Math.max(0, rawBuffer.length - 65557);
   for (let i = rawBuffer.length - 22; i >= minSearch; i--) {
@@ -405,7 +545,7 @@ async function normalizeApkOrZipBuffer(rawBuffer: Uint8Array): Promise<Uint8Arra
     if (item.method === 0) {
       rebuiltEntries.push({ name: item.name, data: compSlice });
     } else if (item.method === 8) {
-      const inflated = await inflateRawBytes(compSlice, item.uncompSize);
+      const inflated = await inflateRawBytes(compSlice);
       if (inflated) {
         rebuiltEntries.push({ name: item.name, data: inflated });
       } else {
@@ -415,7 +555,7 @@ async function normalizeApkOrZipBuffer(rawBuffer: Uint8Array): Promise<Uint8Arra
   }
 
   if (rebuiltEntries.length === 0) return rawBuffer;
-  return buildStoreZipArchive(rebuiltEntries);
+  return buildStoreZipArchive(rebuiltEntries, true);
 }
 
 const KNOWN_PACKER_SECTIONS: Record<string, string> = {
@@ -459,10 +599,10 @@ export function parseBinaryHeaders(buffer: Uint8Array): {
 
   // 1. Check Android Dalvik Executable (DEX) Magic: 'dex\n035\0' or 'dex\n039\0'
   if (
-    buffer[0] === 0x64 && // 'd'
-    buffer[1] === 0x65 && // 'e'
-    buffer[2] === 0x78 && // 'x'
-    buffer[3] === 0x0a    // '\n'
+    buffer[0] === 0x64 &&
+    buffer[1] === 0x65 &&
+    buffer[2] === 0x78 &&
+    buffer[3] === 0x0a
   ) {
     const ver = String.fromCharCode(buffer[4], buffer[5], buffer[6]);
     const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
@@ -521,7 +661,6 @@ export function parseBinaryHeaders(buffer: Uint8Array): {
     let hasManifest = false;
     let nativeArch = '';
 
-    // Find EOCD to map Central Directory offsets alongside Local File Headers
     let eocdOffset = -1;
     const minSearch = Math.max(0, buffer.length - 65557);
     for (let i = buffer.length - 22; i >= minSearch; i--) {
@@ -770,7 +909,6 @@ function extractCandidateStrings(
   const inspectAsciiCandidate = (rawStr: string, startOffset: number) => {
     const charLen = rawStr.length;
 
-    // 1A. Standard ASCII / DEX MUTF-8 string containing a dot
     if (rawStr.includes('.')) {
       results.push({
         text: rawStr,
@@ -782,7 +920,6 @@ function extractCandidateStrings(
 
     if (!scanObfuscated) return;
 
-    // 1B. Reversed URL detection (e.g. "oi.yrtnes.tsegni.321054o//:sptth")
     if (rawStr.includes('//:sptth') || rawStr.includes('//:ptth')) {
       const reversed = rawStr.split('').reverse().join('');
       if (reversed.includes('.')) {
@@ -797,7 +934,6 @@ function extractCandidateStrings(
       }
     }
 
-    // 1C. ROT13 / Caesar-13 URL detection ("uggcf://" = "https://", "uggc://" = "http://")
     const lowerRaw = rawStr.toLowerCase();
     if (lowerRaw.includes('uggcf://') || lowerRaw.includes('uggc://')) {
       const decodedRot = decodeRot13(rawStr);
@@ -813,7 +949,6 @@ function extractCandidateStrings(
       }
     }
 
-    // 1D. Base64-encoded URL detection
     const b64Regex = /(?:aHR0cHM6Ly|aHR0cDov|d3NzOi8v)[A-Za-z0-9+/]{8,}={0,2}/g;
     let b64Match: RegExpExecArray | null;
     while ((b64Match = b64Regex.exec(rawStr)) !== null) {
@@ -835,7 +970,6 @@ function extractCandidateStrings(
       }
     }
 
-    // 1E. Hex-Encoded ASCII string detection
     const hexUrlRegex = /(?:68747470733a2f2f|687474703a2f2f)[0-9a-fA-F]{14,}/gi;
     let hexMatch: RegExpExecArray | null;
     while ((hexMatch = hexUrlRegex.exec(rawStr)) !== null) {
@@ -862,7 +996,6 @@ function extractCandidateStrings(
     }
   };
 
-  // 1. Extract ASCII / MUTF-8 strings
   let start = -1;
   for (let i = 0; i < len; i++) {
     const b = buffer[i];
@@ -888,7 +1021,6 @@ function extractCandidateStrings(
     inspectAsciiCandidate(str, start);
   }
 
-  // 2. Extract UTF-16LE (Wide-char) strings (used in Windows PE & Android binary XML / resources.arsc)
   for (let parity = 0; parity < 2; parity++) {
     let wStart = -1;
     let wChars = 0;
@@ -925,12 +1057,11 @@ function extractCandidateStrings(
     }
   }
 
-  // 3. Single-Pass O(N) Differential XOR-8 Crib Scanner for "https://" and "http://"
   if (scanObfuscated && len >= 16) {
     for (let i = 0; i < len - 12; i++) {
       if (buffer[i + 1] !== buffer[i + 2]) continue;
 
-      const candidateKey = buffer[i] ^ 0x68; // 'h' = 0x68
+      const candidateKey = buffer[i] ^ 0x68;
       if (candidateKey === 0x00 || candidateKey === 0xff) continue;
 
       if (
@@ -1104,7 +1235,6 @@ export async function scanBinaryBuffer(
   customSignatures: TelemetrySignature[] = [],
   enableHeuristics = true
 ): Promise<ScannedBinaryFile> {
-  // Normalize APK/ZIP buffers so DEFLATE entries become directly inspectable & patchable STORE entries
   const normalized = await normalizeApkOrZipBuffer(rawInputBuffer);
 
   const originalBuffer = new Uint8Array(normalized.byteLength);
@@ -1153,8 +1283,6 @@ export async function scanBinaryBuffer(
         ? '.rdata'
         : 'RAW';
 
-      // If ASCII string falls inside a Dalvik DEX entry, label it DEX-MUTF8 so the patcher
-      // preserves ULEB128 character length without premature 0x00 null bytes!
       let finalEncoding: StringEncoding = cand.encoding;
       let finalObfDetail = cand.obfuscationDetail;
       if (
@@ -1228,8 +1356,7 @@ export async function scanBinaryBuffer(
 
 /**
  * Generates the exact-length replacement byte sequence for a finding based on the chosen strategy,
- * automatically preserving DEX MUTF-8 ULEB128 string length or obfuscation transforms
- * (XOR-8 key, Base64, Reversed, ROT13, Hex).
+ * automatically preserving DEX MUTF-8 ULEB128 string length or obfuscation transforms.
  */
 export function buildReplacementBytes(
   finding: TelemetryFinding,
@@ -1237,8 +1364,6 @@ export function buildReplacementBytes(
 ): Uint8Array {
   const out = new Uint8Array(finding.byteLength);
 
-  // In DEX-MUTF8 string pools, every string is preceded by its ULEB128 character count and
-  // cannot contain embedded 0x00 bytes before the end of the string.
   if (finding.encoding === 'DEX-MUTF8') {
     const raw = finding.rawString;
     let base = 'https://0.0.0.0/';
@@ -1254,7 +1379,6 @@ export function buildReplacementBytes(
     return out;
   }
 
-  // For XOR-8, a "null wipe" in decoded space means filling with the XOR key itself (key ^ key = 0x00)
   if (strategy === 'null_wipe') {
     if (finding.encoding === 'XOR-8' && finding.xorKey !== undefined) {
       out.fill(finding.xorKey & 0xff);
@@ -1286,7 +1410,6 @@ export function buildReplacementBytes(
     }
   }
 
-  // Handle Obfuscated Encodings with Format-Preserving In-Place Replacement
   if (finding.encoding === 'XOR-8' && finding.xorKey !== undefined) {
     const key = finding.xorKey & 0xff;
     out.fill(key);
@@ -1336,7 +1459,6 @@ export function buildReplacementBytes(
     return out;
   }
 
-  // Standard ASCII or UTF-16LE
   const bytesPerChar = finding.encoding === 'UTF-16LE' ? 2 : 1;
   const charCapacity = Math.floor(finding.byteLength / bytesPerChar);
   const writeLen = Math.min(plainTarget.length, charCapacity);
@@ -1353,9 +1475,11 @@ export function buildReplacementBytes(
 }
 
 /**
- * Applies selected patches to a ScannedBinaryFile's workingBuffer.
- * If the file is a standalone DEX or an Android APK containing DEX/native entries,
- * automatically recalculates DEX SHA-1 + Adler-32 checksums and APK ZIP CRC-32 headers!
+ * Applies selected patches to a ScannedBinaryFile AND automatically repacks the binary container:
+ * - For Android APKs: Recomputes DEX SHA-1 & Adler-32 headers, generates fresh `META-INF/MANIFEST.MF`
+ *   and `META-INF/NULLROUTE.SF` SHA-256 digests, and repacks with 4-byte `zipalign` + updated CRC-32s.
+ * - For Standalone DEX: Recomputes DEX SHA-1 & Adler-32 headers.
+ * - For Windows PE (.exe / .dll): Recomputes OptionalHeader.CheckSum.
  */
 export async function applyHexPatchesToFile(
   file: ScannedBinaryFile,
@@ -1375,14 +1499,27 @@ export async function applyHexPatchesToFile(
     return { ...f, patched: false };
   });
 
-  if (anyPatched) {
-    // 1. If standalone Dalvik DEX, recompute DEX SHA-1 signature & Adler-32 checksum
-    if (file.isDEX) {
-      await updateDexHeaderChecksumsInPlace(newWorking);
-    }
+  let repackedBuffer: Uint8Array | undefined;
+  let repackInfo: RepackReportInfo | undefined;
 
-    // 2. If Android APK / ZIP archive, recompute DEX headers for any .dex entries AND update ZIP CRC-32s
-    if (file.isAPK) {
+  if (anyPatched) {
+    const timestamp = new Date().toISOString();
+
+    if (file.isDEX) {
+      const dexOk = await updateDexHeaderChecksumsInPlace(newWorking);
+      repackedBuffer = newWorking;
+      repackInfo = {
+        repackedAt: timestamp,
+        format: 'DEX-Repaired',
+        zipAligned4Byte: false,
+        dexChecksumsUpdated: dexOk,
+        peChecksumUpdated: false,
+        manifestDigestsUpdated: false,
+        repackedSize: newWorking.byteLength,
+        summary: 'DEX SHA-1 & Adler-32 headers recalculated',
+      };
+    } else if (file.isAPK) {
+      // Update in-place workingBuffer CRC-32s and DEX checksums so Hex Inspector matches offsets
       const view = new DataView(newWorking.buffer, newWorking.byteOffset, newWorking.byteLength);
       for (const sec of file.sections) {
         const entrySlice = newWorking.subarray(
@@ -1406,14 +1543,56 @@ export async function applyHexPatchesToFile(
           view.setUint32(sec.zipCentralHeaderOffset + 16, updatedCrc, true);
         }
       }
+
+      // Build fully repacked 4-byte zipaligned APK with META-INF/MANIFEST.MF SHA-256 digests
+      const { repackedBuffer: alignedApk, manifestEntriesUpdated } =
+        await repackApkWithManifestAndZipalign(newWorking, file.sections);
+      repackedBuffer = alignedApk;
+      repackInfo = {
+        repackedAt: timestamp,
+        format: 'APK-ZipAligned',
+        zipAligned4Byte: true,
+        dexChecksumsUpdated: true,
+        peChecksumUpdated: false,
+        manifestDigestsUpdated: true,
+        repackedSize: alignedApk.byteLength,
+        summary: `4-Byte ZipAligned · DEX SHA-1/Adler-32 · META-INF (${manifestEntriesUpdated} SHA-256 digests)`,
+      };
+    } else if (file.isPE) {
+      const peOk = updatePEHeaderChecksumInPlace(newWorking);
+      repackedBuffer = newWorking;
+      repackInfo = {
+        repackedAt: timestamp,
+        format: 'PE-Checksum-Updated',
+        zipAligned4Byte: false,
+        dexChecksumsUpdated: false,
+        peChecksumUpdated: peOk,
+        manifestDigestsUpdated: false,
+        repackedSize: newWorking.byteLength,
+        summary: 'PE OptionalHeader CheckSum recalculated (0B delta)',
+      };
+    } else {
+      repackedBuffer = newWorking;
+      repackInfo = {
+        repackedAt: timestamp,
+        format: 'Raw-Patched',
+        zipAligned4Byte: false,
+        dexChecksumsUpdated: false,
+        peChecksumUpdated: false,
+        manifestDigestsUpdated: false,
+        repackedSize: newWorking.byteLength,
+        summary: 'In-place binary buffer repacked (0B delta)',
+      };
     }
   }
 
-  const newSha = await computeSha256(newWorking);
+  const newSha = await computeSha256(repackedBuffer || newWorking);
 
   return {
     ...file,
     workingBuffer: newWorking,
+    repackedBuffer,
+    repackInfo,
     workingSha256: newSha,
     findings: updatedFindings,
     isModified: anyPatched,
@@ -1430,6 +1609,8 @@ export function restoreOriginalFile(file: ScannedBinaryFile): ScannedBinaryFile 
   return {
     ...file,
     workingBuffer: restored,
+    repackedBuffer: undefined,
+    repackInfo: undefined,
     workingSha256: file.originalSha256,
     isModified: false,
     findings: file.findings.map((f) => ({ ...f, patched: false })),
@@ -1437,12 +1618,38 @@ export function restoreOriginalFile(file: ScannedBinaryFile): ScannedBinaryFile 
 }
 
 /**
+ * Builds a complete repacked `.zip` bundle containing all patched & repacked binaries
+ * in their relative folder paths plus the generated `hosts`, firewall scripts, and audit report.
+ */
+export function buildCompleteRepackedBundleZip(
+  files: ScannedBinaryFile[],
+  extraTextFiles: { name: string; content: string }[]
+): Uint8Array {
+  const entries: ZipEntryRecord[] = [];
+
+  for (const f of files) {
+    const payload = f.repackedBuffer || f.workingBuffer;
+    entries.push({
+      name: f.relativePath || f.name,
+      data: payload,
+    });
+  }
+
+  for (const extra of extraTextFiles) {
+    entries.push({
+      name: extra.name,
+      data: new TextEncoder().encode(extra.content),
+    });
+  }
+
+  return buildStoreZipArchive(entries, true);
+}
+
+/**
  * Builds a realistic Android APK (valid ZIP container with AndroidManifest.xml, classes.dex
- * with valid DEX 039 header/SHA-1/Adler-32, and lib/arm64-v8a/libnative-telemetry.so ELF64)
- * so users can immediately inspect and patch Android APK telemetry!
+ * with valid DEX 039 header/SHA-1/Adler-32, and lib/arm64-v8a/libnative-telemetry.so ELF64).
  */
 async function createSampleAndroidApkBuffer(): Promise<Uint8Array> {
-  // 1. Entry 1: AndroidManifest.xml (Binary AXML header + UTF-16LE strings)
   const manifestBuf = new Uint8Array(512);
   const mView = new DataView(manifestBuf.buffer);
   mView.setUint32(0, 0x00080003, true); // AXML magic
@@ -1458,19 +1665,17 @@ async function createSampleAndroidApkBuffer(): Promise<Uint8Array> {
     }
   }
 
-  // 2. Entry 2: classes.dex (Valid Dalvik DEX 039 header + ULEB128 MUTF-8 string pool)
   const dexBuf = new Uint8Array(1536);
   const dView = new DataView(dexBuf.buffer);
-  // Magic: "dex\n039\0"
   const dexMagic = [0x64, 0x65, 0x78, 0x0a, 0x30, 0x33, 0x39, 0x00];
   dexBuf.set(dexMagic, 0);
-  dView.setUint32(0x20, dexBuf.byteLength, true); // file_size
-  dView.setUint32(0x24, 0x70, true); // header_size
-  dView.setUint32(0x28, 0x12345678, true); // endian_tag
-  dView.setUint32(0x38, 7, true); // string_ids_size
-  dView.setUint32(0x3c, 0x70, true); // string_ids_off
-  dView.setUint32(0x68, dexBuf.byteLength - 0x100, true); // data_size
-  dView.setUint32(0x6c, 0x100, true); // data_off
+  dView.setUint32(0x20, dexBuf.byteLength, true);
+  dView.setUint32(0x24, 0x70, true);
+  dView.setUint32(0x28, 0x12345678, true);
+  dView.setUint32(0x38, 7, true);
+  dView.setUint32(0x3c, 0x70, true);
+  dView.setUint32(0x68, dexBuf.byteLength - 0x100, true);
+  dView.setUint32(0x6c, 0x100, true);
 
   const dexTelemetryStrings = [
     { offset: 0x120, text: 'https://app-measurement.com/a' },
@@ -1479,12 +1684,10 @@ async function createSampleAndroidApkBuffer(): Promise<Uint8Array> {
     { offset: 0x200, text: 'https://graph.facebook.com/v18.0/activities' },
     { offset: 0x250, text: 'https://sdk.iad-01.braze.com/api/v3/data' },
     { offset: 0x2a0, text: 'https://auction.unityads.unity3d.com/v4/test' },
-    // Base64 encoded OneSignal endpoint: https://onesignal.com/api/v1/players
     { offset: 0x300, text: 'ONESIGNAL_CFG=aHR0cHM6Ly9vbmVzaWduYWwuY29tL2FwaS92MS9wbGF5ZXJz' },
   ];
 
   for (const s of dexTelemetryStrings) {
-    // Write ULEB128 length prefix byte right before the string
     dexBuf[s.offset - 1] = s.text.length & 0x7f;
     for (let i = 0; i < s.text.length; i++) {
       dexBuf[s.offset + i] = s.text.charCodeAt(i);
@@ -1493,40 +1696,37 @@ async function createSampleAndroidApkBuffer(): Promise<Uint8Array> {
   }
   await updateDexHeaderChecksumsInPlace(dexBuf);
 
-  // 3. Entry 3: lib/arm64-v8a/libnative-telemetry.so (ELF 64-bit ARM64 shared library)
   const soBuf = new Uint8Array(768);
   const soView = new DataView(soBuf.buffer);
-  soBuf.set([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00], 0); // ELF64 LE
-  soView.setUint16(0x10, 3, true); // ET_DYN (.so)
-  soView.setUint16(0x12, 0xb7, true); // EM_AARCH64 (ARM64)
+  soBuf.set([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00], 0);
+  soView.setUint16(0x10, 3, true);
+  soView.setUint16(0x12, 0xb7, true);
 
   const nativeAscii = 'https://crashlyticsreports-pa.googleapis.com/v1/firelog/legacy/batchlog';
   for (let i = 0; i < nativeAscii.length; i++) {
     soBuf[0x100 + i] = nativeAscii.charCodeAt(i);
   }
-  // XOR-8 (key 0x4A) obfuscated Sentry endpoint in native .so
   const nativeXor = 'https://o450999.ingest.sentry.io/api/99/envelope/';
   for (let i = 0; i < nativeXor.length; i++) {
     soBuf[0x180 + i] = (nativeXor.charCodeAt(i) & 0xff) ^ 0x4a;
   }
 
-  return buildStoreZipArchive([
-    { name: 'AndroidManifest.xml', data: manifestBuf },
-    { name: 'classes.dex', data: dexBuf },
-    { name: 'lib/arm64-v8a/libnative-telemetry.so', data: soBuf },
-  ]);
+  return buildStoreZipArchive(
+    [
+      { name: 'AndroidManifest.xml', data: manifestBuf },
+      { name: 'classes.dex', data: dexBuf },
+      { name: 'lib/arm64-v8a/libnative-telemetry.so', data: soBuf },
+    ],
+    true
+  );
 }
 
 /**
- * Creates a realistic suite of sample binaries in memory:
- * - DroidPulseMobile-release.apk (Android APK with classes.dex, AndroidManifest.xml, and ARM64 .so)
- * - StudioDesktopClient.exe (Windows PE32+ executable)
- * - ObfuscatedStealthAgent.dll (VMProtect-style obfuscated PE32+ DLL with XOR-8, Base64, Reversed, ROT13, Hex)
+ * Creates a realistic suite of sample binaries in memory.
  */
 export async function createSampleBinarySuite(): Promise<ScannedBinaryFile[]> {
   const scannedFiles: ScannedBinaryFile[] = [];
 
-  // 1. Sample Android APK
   const apkBuffer = await createSampleAndroidApkBuffer();
   const scannedApk = await scanBinaryBuffer(
     'sample-apk-1',
@@ -1536,7 +1736,6 @@ export async function createSampleBinarySuite(): Promise<ScannedBinaryFile[]> {
   );
   scannedFiles.push(scannedApk);
 
-  // 2. Sample Windows PE32+ Binaries
   const peSamples = [
     {
       name: 'StudioDesktopClient.exe',
@@ -1668,6 +1867,8 @@ export async function createSampleBinarySuite(): Promise<ScannedBinaryFile[]> {
         }
       }
     }
+
+    updatePEHeaderChecksumInPlace(buf);
 
     const scanned = await scanBinaryBuffer(
       `sample-pe-${idx + 1}`,

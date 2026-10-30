@@ -4,10 +4,11 @@
  */
 
 import React, { useEffect, useState } from 'react';
-import { RotateCcw } from 'lucide-react';
+import { PackageCheck, RotateCcw } from 'lucide-react';
 import { TelemetrySignature } from './data/telemetryDatabase';
 import {
   applyHexPatchesToFile,
+  buildCompleteRepackedBundleZip,
   createSampleBinarySuite,
   PatchStrategy,
   restoreOriginalFile,
@@ -15,6 +16,11 @@ import {
   ScannedBinaryFile,
   TelemetryFinding,
 } from './utils/binaryScanner';
+import {
+  generateAndroidApkAndAdbBlocker,
+  generateHostsFileBlocklist,
+  generateWindowsFirewallPowerShell,
+} from './utils/blockerGenerators';
 import { ScannerReportView } from './components/ScannerReportView';
 import { HexInspectorView } from './components/HexInspectorView';
 import { HostsFirewallView } from './components/HostsFirewallView';
@@ -31,6 +37,7 @@ export default function App() {
   const [patchStrategy, setPatchStrategy] = useState<PatchStrategy>('loopback');
   const [customSignatures, setCustomSignatures] = useState<TelemetrySignature[]>([]);
   const [enableHeuristics, setEnableHeuristics] = useState<boolean>(true);
+  const [autoDownloadOnPatch, setAutoDownloadOnPatch] = useState<boolean>(false);
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -38,10 +45,10 @@ export default function App() {
     setToastMessage(msg);
     setTimeout(() => {
       setToastMessage((prev) => (prev === msg ? null : prev));
-    }, 3200);
+    }, 3600);
   };
 
-  // Load the realistic sample PE32+ binary suite on initial mount so the user can test immediately
+  // Load the realistic sample PE32+ & Android APK binary suite on initial mount so the user can test immediately
   useEffect(() => {
     let mounted = true;
     createSampleBinarySuite().then((suite) => {
@@ -92,7 +99,7 @@ export default function App() {
       setFocusedFindingId(suite[0].findings[0]?.id || null);
     }
     setIsScanning(false);
-    showNotice('Loaded 3 sample PE32+ binaries with ASCII & UTF-16LE telemetry strings.');
+    showNotice('Loaded sample PE32+, obfuscated DLL, and Android APK telemetry suite.');
   };
 
   const handleFilesDropped = async (
@@ -163,17 +170,58 @@ export default function App() {
     );
   };
 
+  const triggerBufferDownload = (buffer: Uint8Array, fileName: string, mime = 'application/octet-stream') => {
+    const copy = new Uint8Array(buffer.byteLength);
+    copy.set(buffer);
+    const blob = new Blob([copy.buffer], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadPatchedFile = async (file: ScannedBinaryFile) => {
+    // If user hasn't clicked Commit yet, apply selected patches & automatic repacking on the fly
+    const finalFile = file.isModified
+      ? file
+      : await applyHexPatchesToFile(file, patchStrategy);
+
+    if (!file.isModified) {
+      setFiles((prev) => prev.map((f) => (f.id === file.id ? finalFile : f)));
+    }
+
+    const payloadBuffer = finalFile.repackedBuffer || finalFile.workingBuffer;
+    triggerBufferDownload(payloadBuffer, finalFile.name);
+    showNotice(
+      `Downloaded repacked ${finalFile.name} (${
+        finalFile.repackInfo?.summary || 'In-Place Patched'
+      }).`
+    );
+  };
+
   const handleApplyPatchesToFile = async (fileId: string) => {
     const target = files.find((f) => f.id === fileId);
     if (!target) return;
     const patchedFile = await applyHexPatchesToFile(target, patchStrategy);
     setFiles((prev) => prev.map((f) => (f.id === fileId ? patchedFile : f)));
     const count = patchedFile.findings.filter((x) => x.patched).length;
+    const repackLabel = patchedFile.repackInfo?.summary
+      ? ` · Auto-Repacked (${patchedFile.repackInfo.summary})`
+      : '';
     showNotice(
-      `Committed ${count} in-place hex ${
+      `Committed ${count} hex ${
         count === 1 ? 'patch' : 'patches'
-      } to ${patchedFile.name} (0 byte length delta).`
+      } to ${patchedFile.name}${repackLabel}.`
     );
+
+    if (autoDownloadOnPatch) {
+      const payloadBuffer = patchedFile.repackedBuffer || patchedFile.workingBuffer;
+      triggerBufferDownload(payloadBuffer, patchedFile.name);
+    }
   };
 
   const handleRestoreOriginalFile = (fileId: string) => {
@@ -196,10 +244,78 @@ export default function App() {
       }
     }
     setFiles(updated);
+    const modifiedList = updated.filter((x) => x.isModified);
     showNotice(
-      `Hex-patched ${totalPatched} telemetry occurrences across ${
-        updated.filter((x) => x.isModified).length
-      } binaries.`
+      `Auto-patched & repacked ${totalPatched} telemetry occurrences across ${modifiedList.length} binaries (PE CheckSum / APK 4-Byte ZipAlign + META-INF updated).`
+    );
+
+    if (autoDownloadOnPatch && modifiedList.length > 0) {
+      await handleRepackAndDownloadBundleZip(updated);
+    }
+  };
+
+  const handleRepackAndDownloadBundleZip = async (overrideFiles?: ScannedBinaryFile[]) => {
+    const sourceFiles = overrideFiles || files;
+    if (sourceFiles.length === 0) return;
+
+    const updated: ScannedBinaryFile[] = [];
+    for (const f of sourceFiles) {
+      if (!f.isModified && f.findings.some((x) => x.selected)) {
+        const pf = await applyHexPatchesToFile(f, patchStrategy);
+        updated.push(pf);
+      } else {
+        updated.push(f);
+      }
+    }
+
+    if (!overrideFiles) {
+      setFiles(updated);
+    }
+
+    const hostsContent = generateHostsFileBlocklist(updated, '0.0.0.0', true, true);
+    const ps1Content = generateWindowsFirewallPowerShell(updated, '0.0.0.0');
+    const apkShContent = generateAndroidApkAndAdbBlocker(updated, '0.0.0.0');
+
+    const manifestLines = [
+      '================================================================================',
+      'NullRoute — Offline Automatic Repacked Binary & APK Bundle Manifest',
+      `Generated: ${new Date().toISOString()}`,
+      `Patch Strategy: ${patchStrategy}`,
+      '================================================================================',
+      '',
+      ...updated.map((f) => {
+        const patchedHits = f.findings.filter((x) => x.patched).length;
+        return [
+          `File: ${f.relativePath} (${f.architecture})`,
+          `  Original SHA-256 : ${f.originalSha256}`,
+          `  Repacked SHA-256 : ${f.repackInfo?.repackedSha256 || f.workingSha256}`,
+          `  Patched Endpoints: ${patchedHits} / ${f.findings.length}`,
+          `  Repack Pipeline  : ${f.repackInfo?.summary || 'Unmodified'}`,
+          f.repackInfo?.peChecksumHex
+            ? `  PE Header CheckSum: ${f.repackInfo.peChecksumHex}`
+            : null,
+          f.repackInfo?.zipAlignedEntries
+            ? `  APK ZipAlign (4B): ${f.repackInfo.zipAlignedEntries} entries aligned, META-INF/MANIFEST.MF & NULLROUTE.SF rebuilt`
+            : null,
+          '',
+        ]
+          .filter(Boolean)
+          .join('\n');
+      }),
+    ].join('\n');
+
+    const zipBytes = buildCompleteRepackedBundleZip(updated, [
+      { path: 'NullRoute-Blocker/hosts', content: hostsContent },
+      { path: 'NullRoute-Blocker/Block-Telemetry.ps1', content: ps1Content },
+      { path: 'NullRoute-Blocker/Android-APK-Sign-And-Block.sh', content: apkShContent },
+      { path: 'REPACK-MANIFEST.txt', content: manifestLines },
+    ]);
+
+    triggerBufferDownload(zipBytes, 'NullRoute-Repacked-Suite.zip', 'application/zip');
+    showNotice(
+      `Repacked & downloaded NullRoute-Repacked-Suite.zip (${(zipBytes.byteLength / 1024).toFixed(
+        1
+      )} KB) with ${updated.length} repacked binaries & blocker scripts.`
     );
   };
 
@@ -226,29 +342,6 @@ export default function App() {
     showNotice(
       'Reverted workspace: restored all binaries to their original untouched bytes and SHA-256 checksums.'
     );
-  };
-
-  const handleDownloadPatchedFile = async (file: ScannedBinaryFile) => {
-    // If user hasn't clicked Commit yet, apply selected patches on the fly so downloaded file is patched
-    const finalFile = file.isModified
-      ? file
-      : await applyHexPatchesToFile(file, patchStrategy);
-
-    if (!file.isModified) {
-      setFiles((prev) => prev.map((f) => (f.id === file.id ? finalFile : f)));
-    }
-
-    const copy = new Uint8Array(finalFile.workingBuffer.byteLength);
-    copy.set(finalFile.workingBuffer);
-    const blob = new Blob([copy.buffer], { type: 'application/octet-stream' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = finalFile.name;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   };
 
   const handleDownloadAllPatchedFiles = async () => {
@@ -363,6 +456,17 @@ export default function App() {
 
           <button
             type="button"
+            onClick={() => handleRepackAndDownloadBundleZip()}
+            disabled={files.length === 0}
+            title="Automatically patch, rebuild PE/APK headers & 4-byte zipalign, and download a single .zip bundle"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 disabled:opacity-40 rounded-lg transition-colors whitespace-nowrap shrink-0"
+          >
+            <PackageCheck className="w-3.5 h-3.5" />
+            <span>Auto-Repack Bundle (.zip)</span>
+          </button>
+
+          <button
+            type="button"
             onClick={handlePatchAllFiles}
             className="px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors whitespace-nowrap shrink-0"
           >
@@ -402,6 +506,9 @@ export default function App() {
             onRestoreAllFiles={handleRestoreAllFiles}
             onDownloadPatchedFile={handleDownloadPatchedFile}
             onDownloadAllPatchedFiles={handleDownloadAllPatchedFiles}
+            onRepackAndDownloadBundleZip={() => handleRepackAndDownloadBundleZip()}
+            autoDownloadOnPatch={autoDownloadOnPatch}
+            onToggleAutoDownloadOnPatch={setAutoDownloadOnPatch}
             onInspectFindingInHex={handleInspectFindingInHex}
             onNavigateToBlocker={() => setActiveTab('blocker')}
             isScanning={isScanning}

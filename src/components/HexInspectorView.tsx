@@ -254,7 +254,7 @@ export const HexInspectorView: React.FC<HexInspectorViewProps> = ({
             className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded-md transition-colors whitespace-nowrap shrink-0"
           >
             <Zap className="w-3.5 h-3.5" />
-            Commit {selectedCount} Hex {selectedCount === 1 ? 'Patch' : 'Patches'} to Binary
+            Commit & Repack ({selectedCount})
           </button>
           <button
             type="button"
@@ -262,7 +262,7 @@ export const HexInspectorView: React.FC<HexInspectorViewProps> = ({
             className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-md transition-colors whitespace-nowrap shrink-0"
           >
             <ArrowDownToLine className="w-3.5 h-3.5" />
-            Save Patched {activeFile.name}
+            Save Repacked {activeFile.name}
           </button>
         </div>
       </div>
@@ -637,20 +637,29 @@ export const HexInspectorView: React.FC<HexInspectorViewProps> = ({
               })}
             </div>
 
-            {/* Checksum Footer */}
+            {/* Checksum & Automatic Repacker Footer */}
             <div className="px-4 py-3 bg-slate-900 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-slate-400">
               <div className="truncate">
                 <span className="text-slate-500">Original SHA-256: </span>
-                <span className="text-slate-300">{activeFile.originalSha256.slice(0, 24)}…</span>
+                <span className="text-slate-300">{activeFile.originalSha256.slice(0, 20)}…</span>
               </div>
+              {activeFile.repackInfo && (
+                <div className="truncate text-emerald-400">
+                  <span>Auto-Repack: {activeFile.repackInfo.summary}</span>
+                </div>
+              )}
               <div className="truncate">
-                <span className="text-slate-500">Working SHA-256: </span>
+                <span className="text-slate-500">Repacked SHA-256: </span>
                 <span
                   className={
                     activeFile.isModified ? 'text-emerald-400 font-medium' : 'text-slate-300'
                   }
                 >
-                  {activeFile.workingSha256.slice(0, 24)}…
+                  {(activeFile.repackInfo?.repackedSha256 || activeFile.workingSha256).slice(
+                    0,
+                    20
+                  )}
+                  …
                 </span>
               </div>
             </div>

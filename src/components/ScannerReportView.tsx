@@ -7,6 +7,7 @@ import {
   FileSpreadsheet,
   FolderOpen,
   LockOpen,
+  PackageCheck,
   RotateCcw,
   Search,
   ShieldCheck,
@@ -35,6 +36,9 @@ interface ScannerReportViewProps {
   onRestoreAllFiles: () => void;
   onDownloadPatchedFile: (file: ScannedBinaryFile) => void;
   onDownloadAllPatchedFiles: () => void;
+  onRepackAndDownloadBundleZip: () => void;
+  autoDownloadOnPatch: boolean;
+  onToggleAutoDownloadOnPatch: (enabled: boolean) => void;
   onInspectFindingInHex: (finding: TelemetryFinding) => void;
   onNavigateToBlocker: () => void;
   isScanning: boolean;
@@ -100,6 +104,9 @@ export const ScannerReportView: React.FC<ScannerReportViewProps> = ({
   onRestoreAllFiles,
   onDownloadPatchedFile,
   onDownloadAllPatchedFiles,
+  onRepackAndDownloadBundleZip,
+  autoDownloadOnPatch,
+  onToggleAutoDownloadOnPatch,
   onInspectFindingInHex,
   onNavigateToBlocker,
   isScanning,
@@ -813,43 +820,55 @@ export const ScannerReportView: React.FC<ScannerReportViewProps> = ({
 
       {/* Action & Batch Patching Bar */}
       <div className="flex flex-wrap items-center justify-between gap-4 p-4 bg-slate-900 border border-slate-800 rounded-lg">
-        <div className="flex flex-wrap items-center gap-3">
-          <span className="text-xs font-medium text-slate-300">Hex Replacement Mode:</span>
-          <div className="flex items-center gap-1 p-1 bg-slate-950 border border-slate-800 rounded-md">
-            <button
-              type="button"
-              onClick={() => onChangePatchStrategy('loopback')}
-              className={`px-3 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
-                patchStrategy === 'loopback'
-                  ? 'bg-indigo-600 text-white'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              Loopback (0.0.0.0 + Cipher-Aware Pad)
-            </button>
-            <button
-              type="button"
-              onClick={() => onChangePatchStrategy('nxdomain')}
-              className={`px-3 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
-                patchStrategy === 'nxdomain'
-                  ? 'bg-indigo-600 text-white'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              Host Sinkhole (In-Place)
-            </button>
-            <button
-              type="button"
-              onClick={() => onChangePatchStrategy('null_wipe')}
-              className={`px-3 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
-                patchStrategy === 'null_wipe'
-                  ? 'bg-indigo-600 text-white'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              Full Null / Key Wipe
-            </button>
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs font-medium text-slate-300">Hex Replacement Mode:</span>
+            <div className="flex items-center gap-1 p-1 bg-slate-950 border border-slate-800 rounded-md">
+              <button
+                type="button"
+                onClick={() => onChangePatchStrategy('loopback')}
+                className={`px-3 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
+                  patchStrategy === 'loopback'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Loopback (0.0.0.0 + Cipher-Aware Pad)
+              </button>
+              <button
+                type="button"
+                onClick={() => onChangePatchStrategy('nxdomain')}
+                className={`px-3 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
+                  patchStrategy === 'nxdomain'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Host Sinkhole (In-Place)
+              </button>
+              <button
+                type="button"
+                onClick={() => onChangePatchStrategy('null_wipe')}
+                className={`px-3 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
+                  patchStrategy === 'null_wipe'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Full Null / Key Wipe
+              </button>
+            </div>
           </div>
+
+          <label className="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none px-2.5 py-1.5 bg-slate-950 border border-slate-800 rounded-md">
+            <input
+              type="checkbox"
+              checked={autoDownloadOnPatch}
+              onChange={(e) => onToggleAutoDownloadOnPatch(e.target.checked)}
+              className="rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-indigo-500"
+            />
+            <span>Auto-download repacked file on patch</span>
+          </label>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -881,17 +900,27 @@ export const ScannerReportView: React.FC<ScannerReportViewProps> = ({
             className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 rounded-md transition-colors whitespace-nowrap shrink-0"
           >
             <Zap className="w-3.5 h-3.5" />
-            Hex Patch All Selected ({metrics.selectedHits})
+            Patch & Auto-Repack Selected ({metrics.selectedHits})
+          </button>
+
+          <button
+            type="button"
+            onClick={onRepackAndDownloadBundleZip}
+            disabled={files.length === 0}
+            className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 disabled:opacity-40 rounded-md transition-colors whitespace-nowrap shrink-0"
+          >
+            <PackageCheck className="w-3.5 h-3.5" />
+            Repack & Download Bundle (.zip)
           </button>
 
           {metrics.modifiedFilesCount > 0 && (
             <button
               type="button"
               onClick={onDownloadAllPatchedFiles}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-md transition-colors whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-emerald-300 bg-emerald-950/60 hover:bg-emerald-900/60 border border-emerald-800/60 rounded-md transition-colors whitespace-nowrap shrink-0"
             >
               <ArrowDownToLine className="w-3.5 h-3.5" />
-              Download Patched Binaries ({metrics.modifiedFilesCount})
+              Save Individual Files ({metrics.modifiedFilesCount})
             </button>
           )}
         </div>
@@ -977,6 +1006,12 @@ export const ScannerReportView: React.FC<ScannerReportViewProps> = ({
                     </div>
                   )}
 
+                  {file.isModified && file.repackInfo && (
+                    <div className="mt-1 text-[11px] text-emerald-400 font-mono truncate">
+                      Repacked: {file.repackInfo.summary}
+                    </div>
+                  )}
+
                   <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
                     <span>
                       {file.architecture} · {(file.size / 1024).toFixed(1)} KB
@@ -990,7 +1025,7 @@ export const ScannerReportView: React.FC<ScannerReportViewProps> = ({
                         }}
                         className="text-emerald-400 hover:text-emerald-300 font-medium inline-flex items-center gap-1"
                       >
-                        <ArrowDownToLine className="w-3 h-3" /> Save
+                        <ArrowDownToLine className="w-3 h-3" /> Save Repacked
                       </button>
                     ) : (
                       <span className="text-slate-500">Unmodified</span>
