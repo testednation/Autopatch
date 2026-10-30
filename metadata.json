@@ -1,0 +1,6 @@
+{
+  "name": "NullRoute — Offline Binary Telemetry Auditor & Hex Patcher",
+  "description": "Client-side offline executable and directory scanner that detects embedded telemetry domains, patches binaries in-place with byte-length preservation, and generates Hosts and Firewall block rules.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
